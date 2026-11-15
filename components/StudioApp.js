@@ -63,6 +63,252 @@ export default function StudioApp({ firebaseConfig, vapiConfig }) {
     let waConnecting = false;
     let waStartedAtIso = null;
 
+    /* ---------- Facebook Pages + Messenger ---------- */
+    let facebookState = { configured: false, connected: false, pages: [], selectedPageId: '', autoReply: false };
+
+    async function facebookRequest(path, method = 'GET', body) {
+      const token = await fbAuth.currentUser?.getIdToken();
+      if (!token) throw new Error('Sign in again to manage Facebook Pages.');
+      const res = await fetch(`/api/facebook/${path}`, {
+        method,
+        headers: { Authorization: `Bearer ${token}`, ...(body ? { 'Content-Type': 'application/json' } : {}) },
+        ...(body ? { body: JSON.stringify(body) } : {}),
+        cache: 'no-store'
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || 'Facebook request failed.');
+      return data;
+    }
+
+    async function facebookFetchStatus() {
+      try {
+        facebookState = await facebookRequest('status');
+        facebookUpdateUI();
+        if (facebookState.selectedPageId) {
+          facebookLoadPosts().catch(() => {});
+          facebookLoadScheduled().catch(() => {});
+          facebookLoadInbox().catch(() => {});
+        }
+      } catch (error) {
+        $('facebookStatusText').textContent = error.message;
+      }
+    }
+
+    function facebookUpdateUI() {
+      const { connected, configured, pages = [], selectedPageId, autoReply, webhookSubscribed } = facebookState;
+      const page = pages.find(p => p.id === selectedPageId);
+      $('facebookDot').className = `wa-dot ${page ? 'connected' : 'off'}`;
+      $('facebookStatusText').textContent = !configured ? 'Meta OAuth not configured' :
+        page ? `Connected · ${page.name}` : connected ? `${pages.length} Pages available · select one` : 'Not connected';
+      $('facebookConnect').hidden = !configured;
+      $('facebookConnect').textContent = connected ? 'Reconnect Facebook' : 'Connect Facebook';
+      $('facebookDisconnect').hidden = !connected;
+      $('facebookControls').hidden = !connected;
+      $('facebookEditor').hidden = !page;
+      const select = $('facebookPageSelect');
+      select.replaceChildren(new Option('Select a Facebook Page', ''));
+      pages.forEach(p => select.appendChild(new Option(p.name, p.id)));
+      select.value = page?.id || '';
+      $('facebookAutoReply').checked = Boolean(autoReply);
+      $('facebookAutoReply').disabled = !page || !webhookSubscribed;
+      $('facebookPageInfo').textContent = page
+        ? `${page.name} is linked to this agent. Messenger webhook ${webhookSubscribed ? 'subscribed' : 'not subscribed'}.`
+        : pages.length ? 'Choose a Page that your Facebook account manages.' : 'No managed Pages returned by Meta. Check Page roles and permissions.';
+    }
+
+    async function facebookConnect() {
+      try {
+        const data = await facebookRequest('auth', 'POST');
+        window.location.assign(data.url);
+      } catch (error) { showToast(error.message, true); }
+    }
+
+    async function facebookSelectPage() {
+      const pageId = $('facebookPageSelect').value;
+      if (!pageId) return;
+      const select = $('facebookPageSelect');
+      select.disabled = true;
+      try {
+        await facebookRequest('select', 'POST', { pageId });
+        await facebookRequest('settings', 'POST', { persona: editorData() });
+        await facebookFetchStatus();
+        showToast('Facebook Page connected. Messenger auto-reply is opt-in.');
+      } catch (error) {
+        showToast(error.message, true);
+        await facebookFetchStatus();
+      } finally { select.disabled = false; }
+    }
+
+    async function facebookSyncPersona() {
+      if (!facebookState.selectedPageId) return;
+      try { await facebookRequest('settings', 'POST', { persona: selected() }); }
+      catch (error) { showToast(`Facebook persona sync: ${error.message}`, true); }
+    }
+
+    async function facebookToggleReply() {
+      const toggle = $('facebookAutoReply');
+      toggle.disabled = true;
+      try {
+        await facebookRequest('settings', 'POST', { autoReply: toggle.checked, persona: editorData() });
+        facebookState.autoReply = toggle.checked;
+        showToast(toggle.checked ? 'Messenger automatic replies enabled.' : 'Messenger automatic replies disabled.');
+      } catch (error) {
+        toggle.checked = !toggle.checked;
+        showToast(error.message, true);
+      } finally { toggle.disabled = false; }
+    }
+
+    async function facebookDisconnect() {
+      if (!confirm('Disconnect Facebook and disable Messenger automation?')) return;
+      try {
+        await facebookRequest('disconnect', 'POST');
+        await facebookFetchStatus();
+        $('facebookPosts').replaceChildren();
+        $('facebookInbox').replaceChildren();
+        showToast('Facebook disconnected.');
+      } catch (error) { showToast(error.message, true); }
+    }
+
+    async function facebookPublish() {
+      const message = $('facebookPostText').value.trim();
+      if (!message) return showToast('Write a Facebook post first.', true);
+      if (!confirm('Publish this content on your selected Facebook Page?')) return;
+      const button = $('facebookPublish');
+      button.disabled = true;
+      try {
+        await facebookRequest('posts', 'POST', { message });
+        $('facebookPostText').value = '';
+        showToast('Page post published.');
+        await facebookLoadPosts();
+      } catch (error) { showToast(error.message, true); }
+      finally { button.disabled = false; }
+    }
+
+    async function facebookSchedule() {
+      const message = $('facebookPostText').value.trim();
+      const value = $('facebookScheduleAt').value;
+      if (!message || !value) return showToast('Write a post and select a publish date/time.', true);
+      const parsed = new Date(value);
+      if (Number.isNaN(parsed.getTime())) return showToast('Choose a valid schedule time.', true);
+      const publishAt = parsed.toISOString();
+      if (!confirm(`Schedule this post to publish at ${new Date(publishAt).toLocaleString()}?`)) return;
+      try {
+        await facebookRequest('posts', 'POST', { message, publishAt });
+        $('facebookPostText').value = '';
+        showToast('Facebook post scheduled through Meta.');
+        await facebookLoadScheduled();
+      } catch (error) { showToast(error.message, true); }
+    }
+
+    async function facebookLoadScheduled() {
+      if (!facebookState.selectedPageId) return;
+      const target = $('facebookScheduledPosts');
+      target.textContent = 'Checking scheduled Page posts…';
+      try {
+        const { data: posts } = await facebookRequest('posts?scheduled=1');
+        target.replaceChildren();
+        if (!posts.length) target.textContent = 'No scheduled posts.';
+        for (const post of posts) {
+          const item = document.createElement('div'); item.className = 'fb-post';
+          const date = document.createElement('strong');
+          date.textContent = `Scheduled: ${new Date(Number(post.scheduled_publish_time) * 1000).toLocaleString()}`;
+          const caption = document.createElement('p'); caption.textContent = post.message || '(No caption)';
+          const cancel = document.createElement('button');
+          cancel.type = 'button'; cancel.className = 'wa-btn ghost'; cancel.textContent = 'Delete scheduled post';
+          cancel.addEventListener('click', async () => {
+            if (!confirm('Delete this scheduled Facebook Page post?')) return;
+            try {
+              await facebookRequest('posts', 'DELETE', { postId: post.id, confirm: true });
+              showToast('Scheduled post deleted.');
+              await facebookLoadScheduled();
+            } catch (error) { showToast(error.message, true); }
+          });
+          item.append(date, caption, cancel); target.appendChild(item);
+        }
+      } catch (error) { target.textContent = error.message; }
+    }
+
+    async function facebookLoadPosts() {
+      if (!facebookState.selectedPageId) return;
+      const target = $('facebookPosts');
+      target.textContent = 'Loading Page posts…';
+      try {
+        const { data: posts } = await facebookRequest('posts');
+        target.replaceChildren();
+        if (!posts.length) target.textContent = 'No recent Page posts found.';
+        for (const post of posts) {
+          const item = document.createElement('div');
+          item.className = 'fb-post';
+          const message = document.createElement('p');
+          message.textContent = post.message || '(Media post without a caption)';
+          const actions = document.createElement('div');
+          actions.className = 'wa-actions';
+          const edit = document.createElement('button');
+          edit.type = 'button'; edit.className = 'wa-btn ghost'; edit.textContent = 'Edit';
+          edit.addEventListener('click', async () => {
+            const newMessage = prompt('Edit Page post:', post.message || '');
+            if (newMessage === null || !newMessage.trim() || newMessage === post.message) return;
+            if (!confirm('Save the new text to your Facebook Page?')) return;
+            try {
+              await facebookRequest('posts', 'PATCH', { postId: post.id, message: newMessage });
+              showToast('Page post updated.');
+              await facebookLoadPosts();
+            } catch (error) { showToast(error.message, true); }
+          });
+          const del = document.createElement('button');
+          del.type = 'button'; del.className = 'wa-btn ghost'; del.textContent = 'Delete';
+          del.addEventListener('click', async () => {
+            if (!confirm('Permanently delete this Facebook Page post? This cannot be undone.')) return;
+            try {
+              await facebookRequest('posts', 'DELETE', { postId: post.id, confirm: true });
+              showToast('Page post deleted.');
+              await facebookLoadPosts();
+            } catch (error) { showToast(error.message, true); }
+          });
+          actions.append(edit, del);
+          if (post.permalink_url) {
+            const link = document.createElement('a');
+            link.href = post.permalink_url; link.target = '_blank'; link.rel = 'noopener noreferrer';
+            link.textContent = 'View post'; link.className = 'fb-link';
+            actions.appendChild(link);
+          }
+          item.append(message, actions);
+          target.appendChild(item);
+        }
+      } catch (error) { target.textContent = error.message; }
+    }
+
+    async function facebookLoadInbox() {
+      if (!facebookState.selectedPageId) return;
+      const target = $('facebookInbox');
+      target.textContent = 'Loading Messenger conversations…';
+      try {
+        const { conversations } = await facebookRequest('inbox');
+        target.replaceChildren();
+        if (!conversations.length) target.textContent = 'No inbound text messages yet. Messenger threads appear after webhook delivery.';
+        for (const conversation of conversations) {
+          const item = document.createElement('div'); item.className = 'fb-post';
+          const heading = document.createElement('strong'); heading.textContent = `Messenger sender: ${conversation.senderId}`;
+          const preview = document.createElement('p');
+          preview.textContent = conversation.recent?.slice(-3).map(m => `${m.role}: ${m.text}`).join('\n') || '';
+          const reply = document.createElement('button');
+          reply.type = 'button'; reply.className = 'wa-btn ghost'; reply.textContent = 'Reply';
+          reply.addEventListener('click', async () => {
+            const text = prompt(`Reply to Messenger user ${conversation.senderId}:`);
+            if (!text?.trim()) return;
+            if (!confirm('Send this reply from your Facebook Page?')) return;
+            try {
+              await facebookRequest('reply', 'POST', { recipientId: conversation.senderId, message: text });
+              showToast('Messenger reply sent.');
+              await facebookLoadInbox();
+            } catch (error) { showToast(error.message, true); }
+          });
+          item.append(heading, preview, reply);
+          target.appendChild(item);
+        }
+      } catch (error) { target.textContent = error.message; }
+    }
+
     /* ---------- Gmail integration ---------- */
     let gmailConnected = false;
     let gmailEmail = '';
@@ -366,6 +612,7 @@ export default function StudioApp({ firebaseConfig, vapiConfig }) {
         return;
       }
       profiles[index] = persona;
+      facebookSyncPersona().catch(() => {});
       const persisted = saveStore();
       dirty = false;
       renderProfileList();
@@ -942,6 +1189,7 @@ export default function StudioApp({ firebaseConfig, vapiConfig }) {
       setCallState('idle');
       initWhatsApp().catch(() => {});
       gmailFetchStatus().catch(() => {});
+      facebookFetchStatus().catch(() => {});
 
       // Handle Gmail OAuth callback redirect.
       try {
@@ -952,6 +1200,16 @@ export default function StudioApp({ firebaseConfig, vapiConfig }) {
           showToast('Gmail connected successfully.');
         } else if (params.get('gmail') === 'error') {
           showToast(`Gmail connection failed: ${params.get('reason') || 'unknown error'}`, true);
+        }
+        if (params.has('facebook')) {
+          const result = params.get('facebook');
+          if (result === 'connected') showToast('Facebook authorized. Now select your Page.');
+          else if (result === 'no_pages') showToast('Facebook connected, but Meta returned no managed Pages.', true);
+          else showToast(`Facebook authentication failed: ${result}`, true);
+          facebookFetchStatus().catch(() => {});
+          const cleanUrl = new URL(location.href);
+          cleanUrl.searchParams.delete('facebook');
+          window.history.replaceState({}, '', cleanUrl.pathname + cleanUrl.search);
         }
         if (params.has('gmail')) {
           const url = new URL(location.href);
@@ -970,6 +1228,7 @@ export default function StudioApp({ firebaseConfig, vapiConfig }) {
       currentId = event.target.value;
       fillEditor(selected());
       saveStore();
+      facebookSyncPersona().catch(() => {});
     };
 
     const onAddProfile = () => {
@@ -1605,6 +1864,15 @@ export default function StudioApp({ firebaseConfig, vapiConfig }) {
     $('waTabQr')?.addEventListener('click', () => switchWaTab('qr'));
     $('waTabCode')?.addEventListener('click', () => switchWaTab('code'));
 
+    $('facebookConnect')?.addEventListener('click', facebookConnect);
+    $('facebookDisconnect')?.addEventListener('click', facebookDisconnect);
+    $('facebookPageSelect')?.addEventListener('change', facebookSelectPage);
+    $('facebookAutoReply')?.addEventListener('change', facebookToggleReply);
+    $('facebookPublish')?.addEventListener('click', facebookPublish);
+    $('facebookSchedule')?.addEventListener('click', facebookSchedule);
+    $('facebookRefreshPosts')?.addEventListener('click', facebookLoadPosts);
+    $('facebookRefreshScheduled')?.addEventListener('click', facebookLoadScheduled);
+    $('facebookRefreshInbox')?.addEventListener('click', facebookLoadInbox);
     $('gmailConnect')?.addEventListener('click', () => gmailConnect());
     $('gmailDisconnect')?.addEventListener('click', () => gmailDisconnect());
     ['gdrive', 'gsheets', 'gdocs', 'gslides', 'gcal', 'gcontacts'].forEach((svc) => {
@@ -1996,6 +2264,63 @@ export default function StudioApp({ firebaseConfig, vapiConfig }) {
                   After each finished call, the agent sends a transcript summary to your WhatsApp.
                   Nothing is shared with third parties.
                 </p>
+              </section>
+
+              <section className="wa-card" aria-labelledby="facebookHeading">
+                <div className="wa-head">
+                  <span className="wa-icon" aria-hidden="true" style={{ background: '#162c57', color: '#65a0ff' }}>
+                    <svg viewBox="0 0 24 24" fill="currentColor"><path d="M22 12C22 6.48 17.52 2 12 2S2 6.48 2 12c0 4.99 3.66 9.13 8.44 9.88v-6.98H7.9V12h2.54V9.8c0-2.5 1.49-3.89 3.77-3.89 1.09 0 2.23.2 2.23.2v2.46h-1.26c-1.24 0-1.63.77-1.63 1.56V12h2.77l-.44 2.9h-2.33v6.98C18.34 21.13 22 16.99 22 12z"/></svg>
+                  </span>
+                  <div className="wa-head-text">
+                    <div className="wa-title" id="facebookHeading">Facebook Pages &amp; Messenger</div>
+                    <div className="wa-sub" id="facebookStatusText">Checking connection…</div>
+                  </div>
+                  <span className="wa-dot" id="facebookDot" aria-hidden="true" />
+                </div>
+                <p className="wa-note">Authorize your Facebook account, choose one managed Page and use your CSR agent to post content or answer customer messages.</p>
+                <div className="wa-actions">
+                  <button className="wa-btn" type="button" id="facebookConnect">Connect Facebook</button>
+                  <button className="wa-btn ghost" type="button" id="facebookDisconnect" hidden>Disconnect</button>
+                </div>
+                <div id="facebookControls" className="fb-controls" hidden>
+                  <div className="wa-field">
+                    <label htmlFor="facebookPageSelect">Facebook Page for this agent</label>
+                    <select id="facebookPageSelect" aria-label="Select Facebook Page"><option value="">Select a Facebook Page</option></select>
+                    <p className="wa-note" id="facebookPageInfo" />
+                  </div>
+                </div>
+                <div id="facebookEditor" className="fb-controls" hidden>
+                  <label className="wa-toggle">
+                    <input type="checkbox" id="facebookAutoReply" />
+                    <span>Automatically reply to incoming Messenger chats</span>
+                  </label>
+                  <p className="wa-note">Uses the current agent persona and configured Gemini model. Replies are restricted to customer-initiated conversations within the standard 24-hour window.</p>
+                  <div className="wa-field">
+                    <label htmlFor="facebookPostText">Create Facebook Page post</label>
+                    <textarea id="facebookPostText" rows="3" maxLength="10000" placeholder="Write a post for your Facebook Page…" />
+                  </div>
+                  <div className="wa-actions">
+                    <button className="wa-btn" type="button" id="facebookPublish">Publish post</button>
+                    <button className="wa-btn ghost" type="button" id="facebookRefreshPosts">Refresh posts</button>
+                  </div>
+                  <div className="wa-field">
+                    <label htmlFor="facebookScheduleAt">Schedule publishing (local time)</label>
+                    <input id="facebookScheduleAt" type="datetime-local" />
+                  </div>
+                  <div className="wa-actions"><button className="wa-btn ghost" type="button" id="facebookSchedule">Schedule post</button></div>
+                  <div className="wa-actions fb-inbox-title">
+                    <span className="fb-mini-heading">Scheduled posts</span>
+                    <button className="wa-btn ghost" type="button" id="facebookRefreshScheduled">Refresh</button>
+                  </div>
+                  <div className="fb-list" id="facebookScheduledPosts" aria-live="polite" />
+                  <div className="fb-mini-heading">Recent Page posts</div>
+                  <div className="fb-list" id="facebookPosts" aria-live="polite" />
+                  <div className="wa-actions fb-inbox-title">
+                    <span className="fb-mini-heading">Messenger conversations</span>
+                    <button className="wa-btn ghost" type="button" id="facebookRefreshInbox">Refresh inbox</button>
+                  </div>
+                  <div className="fb-list" id="facebookInbox" aria-live="polite" />
+                </div>
               </section>
 
               <section className="wa-card" aria-labelledby="gmailHeading">

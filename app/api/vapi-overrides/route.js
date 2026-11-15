@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 
 import { buildOverrides } from '@/lib/agent-overrides';
+import { issueToolToken, readAccount } from '@/lib/facebook';
 import { verifyFirebaseToken } from '@/lib/verify-token';
 
 export const runtime = 'nodejs';
@@ -40,7 +41,20 @@ export async function POST(request) {
     }
   } catch (error) {}
 
-  body = { ...body, gmailConnected, gmailEmail, uid: auth.uid };
+  let facebookConnected = false;
+  let facebookPageName = '';
+  let facebookToolToken = '';
+  try {
+    const account = await readAccount(auth.uid);
+    const page = account?.pages?.find(p => p.id === account.selectedPageId);
+    if (page && account?.webhookSubscribed) {
+      facebookConnected = true;
+      facebookPageName = page.name;
+      facebookToolToken = issueToolToken(auth.uid);
+    }
+  } catch (error) {}
+
+  body = { ...body, gmailConnected, gmailEmail, uid: auth.uid, facebookConnected, facebookPageName, facebookToolToken };
 
   try {
     const overrides = buildOverrides(body);
