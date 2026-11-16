@@ -183,3 +183,10 @@ npm run build
 ```
 
 Automated unit tests cover encryption, signed webhook and tool tokens, token redaction and Page post ownership. Live OAuth/Webhooks/Post/Send API flows require **your Meta app credentials**, authorized Pages, an HTTPS deployment, and real API review/permissions; those cannot be validated with placeholders. Messenger attachments, rich templates, comment moderation, Instagram, and automatic bulk outbound marketing are **not** included. Meta messaging outside the standard customer-initiated 24-hour window requires separate compliant features/permissions. Meta platform limits and Page-level access always prevail over the app UI.
+
+
+## Canva Connect (designs, exports and voice-agent tools)
+
+CSR Agent Studio includes **Connect to Canva** immediately after Facebook. Each user can authorize their own Canva account with OAuth PKCE, browse and create designs, export finished assets, and let their voice agent use approved Canva REST operations. Canva tokens are server-only and encrypted. The integration respects the account’s OAuth scopes and Canva plan. Arbitrary element-level editing requires a separate Canva MCP integration.
+
+See [CANVA_INTEGRATION_STATUS.md](CANVA_INTEGRATION_STATUS.md) and `.env.example` for setup instructions, scopes, test commands and production limitations.

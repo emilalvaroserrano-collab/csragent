@@ -284,3 +284,11 @@ body.wa-modal-open{overflow:hidden}
 .fb-post .wa-btn{height:30px;padding:0 10px}
 .fb-inbox-title{align-items:center;justify-content:space-between}
 .fb-link{color:var(--mint);font-size:12px;align-self:center}
+
+/* Canva integration shares the existing WhatsApp/Facebook card system. */
+.canva-input { flex: 1 1 180px; min-width: 0; padding: 10px 12px; border: 1px solid var(--border, #555); border-radius: 9px; color: inherit; background: var(--input, rgba(255,255,255,.04)); }
+.canva-size-row { flex-wrap: wrap; }
+.canva-size-row label { flex: 1 1 105px; font-size: 12px; }
+.canva-size-row input { display: block; width: 100%; padding: 7px; margin-top: 4px; border-radius: 8px; border: 1px solid var(--border, #555); background: transparent; color: inherit; }
+.canva-design .wa-actions { flex-wrap: wrap; }
+.canva-design a.wa-btn { display: inline-flex; align-items: center; justify-content: center; text-decoration: none; }

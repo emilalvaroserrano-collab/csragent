@@ -309,6 +309,162 @@ export default function StudioApp({ firebaseConfig, vapiConfig }) {
       } catch (error) { target.textContent = error.message; }
     }
 
+    /* ---------- Canva design workspace ---------- */
+    let canvaState = { configured: false, connected: false, scopes: [], previewGeneration: false };
+    let canvaNextDesigns = '';
+    let canvaLastExport = '';
+    let canvaLastGeneration = '';
+    async function canvaRequest(path, method = 'GET', body) {
+      const token = await fbAuth.currentUser?.getIdToken();
+      if (!token) throw new Error('Sign in to manage Canva.');
+      const response = await fetch(`/api/canva/${path}`, {
+        method, cache: 'no-store',
+        headers: { Authorization: `Bearer ${token}`, ...(body ? { 'Content-Type': 'application/json' } : {}) },
+        ...(body ? { body: JSON.stringify(body) } : {})
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(data.error || 'Canva request failed.');
+      return data.data === undefined ? data : data.data;
+    }
+    async function canvaFetchStatus() {
+      try {
+        canvaState = await canvaRequest('status');
+        $('canvaStatusText').textContent = !canvaState.configured ? 'Canva OAuth not configured' :
+          canvaState.connected ? `Connected${canvaState.name ? ` · ${canvaState.name}` : ''}` : 'Not connected';
+        $('canvaDot').className = `wa-dot ${canvaState.connected ? 'connected' : 'off'}`;
+        $('canvaConnect').hidden = !canvaState.configured;
+        $('canvaConnect').textContent = canvaState.connected ? 'Reconnect Canva' : 'Connect to Canva';
+        $('canvaDisconnect').hidden = !canvaState.connected;
+        $('canvaWorkspace').hidden = !canvaState.connected;
+        $('canvaGeneration').hidden = !canvaState.connected || !canvaState.previewGeneration;
+        $('canvaPermissionInfo').textContent = canvaState.connected
+          ? `${canvaState.scopes?.length || 0} OAuth scopes granted. The agent can only use supported APIs within your Canva permissions.`
+          : 'Access requires your Canva consent; advanced editing may require Canva MCP.';
+        if (canvaState.connected) await canvaLoadDesigns(false);
+        else { $('canvaDesignList').replaceChildren(); canvaNextDesigns = ''; }
+      } catch (error) { $('canvaStatusText').textContent = error.message; }
+    }
+    async function canvaConnect() {
+      try { const result = await canvaRequest('auth', 'POST'); window.location.assign(result.url); }
+      catch (error) { showToast(error.message, true); }
+    }
+    async function canvaDisconnect() {
+      if (!confirm('Disconnect Canva and revoke the agent’s access to your Canva account?')) return;
+      try { await canvaRequest('disconnect', 'POST'); await canvaFetchStatus(); showToast('Canva disconnected.'); }
+      catch (error) { showToast(error.message, true); }
+    }
+    function canvaSafeLink(url, label) {
+      let href;
+      try {
+        const target = new URL(url);
+        if (target.protocol !== 'https:' || !['canva.com', 'www.canva.com'].includes(target.hostname)) return null;
+        href = target.href;
+      } catch { return null; }
+      const a = document.createElement('a');
+      a.className = 'wa-btn ghost'; a.href = href; a.target = '_blank'; a.rel = 'noopener noreferrer';
+      a.textContent = label;
+      return a;
+    }
+    async function canvaLoadDesigns(more = false) {
+      if (!canvaState.connected) return;
+      const list = $('canvaDesignList');
+      if (!more) { list.textContent = 'Loading Canva designs…'; canvaNextDesigns = ''; }
+      try {
+        const query = new URLSearchParams({ limit: '20', query: $('canvaSearch').value.trim() });
+        if (more && canvaNextDesigns) query.set('continuation', canvaNextDesigns);
+        const result = await canvaRequest(`designs?${query.toString()}`);
+        if (!more) list.replaceChildren();
+        if (!result.items?.length && !more) list.textContent = 'No designs found.';
+        for (const design of result.items || []) {
+          const item = document.createElement('div'); item.className = 'fb-post canva-design';
+          const heading = document.createElement('strong'); heading.textContent = design.title || 'Untitled design';
+          const subtitle = document.createElement('p');
+          subtitle.textContent = `${design.type || 'Design'}${design.updatedAt ? ` · Updated ${new Date(Number(design.updatedAt) * 1000).toLocaleDateString()}` : ''}`;
+          item.append(heading, subtitle);
+          const actions = document.createElement('div'); actions.className = 'wa-actions';
+          const edit = canvaSafeLink(design.editUrl, 'Open in Canva');
+          if (edit) actions.append(edit);
+          const exportBtn = document.createElement('button'); exportBtn.className = 'wa-btn ghost';
+          exportBtn.type = 'button'; exportBtn.textContent = 'Export';
+          exportBtn.addEventListener('click', () => canvaExportDesign(design.id));
+          actions.append(exportBtn); item.append(actions); list.append(item);
+        }
+        canvaNextDesigns = result.continuation || '';
+        $('canvaMoreDesigns').hidden = !canvaNextDesigns;
+      } catch (error) { showToast(error.message, true); if (!more) list.textContent = 'Unable to load designs.'; }
+    }
+    async function canvaCreateDesign() {
+      const title = $('canvaNewTitle').value.trim();
+      const type = $('canvaNewType').value;
+      if (!title) return showToast('Enter a Canva design title.', true);
+      const args = { title, type };
+      if (type === 'custom') { args.width = Number($('canvaWidth').value); args.height = Number($('canvaHeight').value); }
+      if (!confirm(`Create a new ${type} design in your connected Canva account?`)) return;
+      const btn = $('canvaCreate'); btn.disabled = true;
+      try {
+        const design = await canvaRequest('designs', 'POST', args);
+        showToast('Canva design created.');
+        $('canvaNewTitle').value = '';
+        const link = canvaSafeLink(design.editUrl, 'Open your new design in Canva');
+        const target = $('canvaLatestResult'); target.replaceChildren();
+        if (link) target.append(link);
+        await canvaLoadDesigns(false);
+      } catch (error) { showToast(error.message, true); }
+      finally { btn.disabled = false; }
+    }
+    async function canvaExportDesign(designId) {
+      const format = $('canvaExportFormat').value;
+      if (!confirm(`Export this Canva design as ${format.toUpperCase()}?`)) return;
+      try {
+        const result = await canvaRequest('exports', 'POST', { designId, format });
+        canvaLastExport = result.job?.id || '';
+        $('canvaExportResult').textContent = canvaLastExport ? `Export job ${canvaLastExport} created. Check its status below.` : 'Canva export request submitted.';
+        await canvaPollExport();
+      } catch (error) { showToast(error.message, true); }
+    }
+    async function canvaPollExport() {
+      if (!canvaLastExport) return;
+      try {
+        const job = await canvaRequest(`exports?id=${encodeURIComponent(canvaLastExport)}`);
+        const target = $('canvaExportResult'); target.replaceChildren();
+        const label = document.createElement('span'); label.textContent = `Export ${job.status || 'pending'}. `;
+        target.append(label);
+        if (job.status === 'success') {
+          for (const url of job.urls || []) {
+            // Download links are returned by Canva, typically on document-export.canva.com.
+            try {
+              const parsed = new URL(url);
+              if (parsed.protocol !== 'https:' || !parsed.hostname.endsWith('.canva.com')) continue;
+              const link = document.createElement('a'); link.href = parsed.href; link.target = '_blank';
+              link.rel = 'noopener noreferrer'; link.textContent = 'Download export'; target.append(link);
+            } catch {}
+          }
+        }
+      } catch (error) { showToast(error.message, true); }
+    }
+    async function canvaGenerateDesign() {
+      const brief = $('canvaBrief').value.trim(), type = $('canvaGenerationType').value;
+      if (!brief) return showToast('Describe the design you want to generate.', true);
+      if (!confirm('Use your Canva AI credit allowance to generate this design?')) return;
+      try {
+        const result = await canvaRequest('generations', 'POST', { brief, type });
+        canvaLastGeneration = result.job?.id || '';
+        $('canvaGenerationResult').textContent = canvaLastGeneration ? 'Generation started. Use Check result to view progress.' : 'Canva accepted the generation request.';
+      } catch (error) { showToast(error.message, true); }
+    }
+    async function canvaPollGeneration() {
+      if (!canvaLastGeneration) return showToast('Create a generation job first.', true);
+      try {
+        const result = await canvaRequest(`generations?id=${encodeURIComponent(canvaLastGeneration)}`);
+        const job = result.job || {};
+        const target = $('canvaGenerationResult'); target.replaceChildren();
+        const label = document.createElement('span'); label.textContent = `Generation: ${job.status || 'pending'}. `; target.append(label);
+        const design = job.design || job.result?.design;
+        const link = canvaSafeLink(design?.urls?.edit_url || design?.url, 'Open generated design');
+        if (link) target.append(link);
+      } catch (error) { showToast(error.message, true); }
+    }
+
     /* ---------- Gmail integration ---------- */
     let gmailConnected = false;
     let gmailEmail = '';
@@ -1190,6 +1346,7 @@ export default function StudioApp({ firebaseConfig, vapiConfig }) {
       initWhatsApp().catch(() => {});
       gmailFetchStatus().catch(() => {});
       facebookFetchStatus().catch(() => {});
+      canvaFetchStatus().catch(() => {});
 
       // Handle Gmail OAuth callback redirect.
       try {
@@ -1209,6 +1366,14 @@ export default function StudioApp({ firebaseConfig, vapiConfig }) {
           facebookFetchStatus().catch(() => {});
           const cleanUrl = new URL(location.href);
           cleanUrl.searchParams.delete('facebook');
+          window.history.replaceState({}, '', cleanUrl.pathname + cleanUrl.search);
+        }
+        if (params.has('canva')) {
+          const result = params.get('canva');
+          showToast(result === 'connected' ? 'Canva connected successfully.' : `Canva connection: ${result}`, result !== 'connected');
+          canvaFetchStatus().catch(() => {});
+          const cleanUrl = new URL(location.href);
+          cleanUrl.searchParams.delete('canva');
           window.history.replaceState({}, '', cleanUrl.pathname + cleanUrl.search);
         }
         if (params.has('gmail')) {
@@ -1873,6 +2038,17 @@ export default function StudioApp({ firebaseConfig, vapiConfig }) {
     $('facebookRefreshPosts')?.addEventListener('click', facebookLoadPosts);
     $('facebookRefreshScheduled')?.addEventListener('click', facebookLoadScheduled);
     $('facebookRefreshInbox')?.addEventListener('click', facebookLoadInbox);
+    $('canvaConnect')?.addEventListener('click', canvaConnect);
+    $('canvaDisconnect')?.addEventListener('click', canvaDisconnect);
+    $('canvaSearchBtn')?.addEventListener('click', () => canvaLoadDesigns(false));
+    $('canvaMoreDesigns')?.addEventListener('click', () => canvaLoadDesigns(true));
+    $('canvaCreate')?.addEventListener('click', canvaCreateDesign);
+    $('canvaExportRefresh')?.addEventListener('click', canvaPollExport);
+    $('canvaGenerateBtn')?.addEventListener('click', canvaGenerateDesign);
+    $('canvaGenerationRefresh')?.addEventListener('click', canvaPollGeneration);
+    $('canvaNewType')?.addEventListener('change', () => {
+      $('canvaCustomDimensions').hidden = $('canvaNewType').value !== 'custom';
+    });
     $('gmailConnect')?.addEventListener('click', () => gmailConnect());
     $('gmailDisconnect')?.addEventListener('click', () => gmailDisconnect());
     ['gdrive', 'gsheets', 'gdocs', 'gslides', 'gcal', 'gcontacts'].forEach((svc) => {
@@ -2320,6 +2496,79 @@ export default function StudioApp({ firebaseConfig, vapiConfig }) {
                     <button className="wa-btn ghost" type="button" id="facebookRefreshInbox">Refresh inbox</button>
                   </div>
                   <div className="fb-list" id="facebookInbox" aria-live="polite" />
+                </div>
+              </section>
+
+              <section className="wa-card" aria-labelledby="canvaHeading">
+                <div className="wa-head">
+                  <span className="wa-icon" aria-hidden="true" style={{ background: 'linear-gradient(135deg, #08c4cd, #7b2fff)', color: '#ffffff' }}>
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2"><path d="M18 5a7.5 7.5 0 1 0 .5 13"/><path d="M17.8 6c-3.8 2.1-4.9 8.4-2.4 10.1 1.1.7 2.5.2 3.6-1.5"/></svg>
+                  </span>
+                  <div className="wa-head-text">
+                    <div className="wa-title" id="canvaHeading">Canva Design Studio</div>
+                    <div className="wa-sub" id="canvaStatusText">Checking connection…</div>
+                  </div>
+                  <span className="wa-dot" id="canvaDot" aria-hidden="true" />
+                </div>
+                <p className="wa-note">Connect your Canva account to discover designs, create new content, export assets and let your CSR agent use the available Canva design tools.</p>
+                <div className="wa-actions">
+                  <button className="wa-btn" type="button" id="canvaConnect">Connect to Canva</button>
+                  <button className="wa-btn ghost" type="button" id="canvaDisconnect" hidden>Disconnect Canva</button>
+                </div>
+                <p className="wa-note" id="canvaPermissionInfo">Connect with OAuth to grant account-specific Canva permissions.</p>
+                <div id="canvaWorkspace" className="fb-controls" hidden>
+                  <div className="fb-mini-heading">Your Canva designs</div>
+                  <div className="wa-actions">
+                    <input id="canvaSearch" className="canva-input" type="search" maxLength="255" placeholder="Search your designs" aria-label="Search Canva designs" />
+                    <button className="wa-btn ghost" type="button" id="canvaSearchBtn">Search</button>
+                  </div>
+                  <div className="fb-list" id="canvaDesignList" aria-live="polite" />
+                  <button className="wa-btn ghost" type="button" id="canvaMoreDesigns" hidden>Load more designs</button>
+                  <div className="fb-mini-heading">Create Canva design</div>
+                  <div className="wa-field">
+                    <label htmlFor="canvaNewTitle">Design title</label>
+                    <input id="canvaNewTitle" className="canva-input" maxLength="255" placeholder="New campaign creative" />
+                    <label htmlFor="canvaNewType">Design type</label>
+                    <select id="canvaNewType" defaultValue="custom">
+                      <option value="custom">Custom size</option>
+                      <option value="presentation">Presentation</option>
+                      <option value="doc">Document</option>
+                      <option value="whiteboard">Whiteboard</option>
+                      <option value="email">Email</option>
+                    </select>
+                    <div className="wa-actions canva-size-row" id="canvaCustomDimensions">
+                      <label htmlFor="canvaWidth">Width <input id="canvaWidth" type="number" min="40" max="8000" defaultValue="1080" /></label>
+                      <label htmlFor="canvaHeight">Height <input id="canvaHeight" type="number" min="40" max="8000" defaultValue="1080" /></label>
+                    </div>
+                  </div>
+                  <button className="wa-btn" type="button" id="canvaCreate">Create design</button>
+                  <div id="canvaLatestResult" className="wa-actions" aria-live="polite" />
+                  <div className="fb-mini-heading">Export designs</div>
+                  <div className="wa-actions">
+                    <label htmlFor="canvaExportFormat">Format</label>
+                    <select id="canvaExportFormat" defaultValue="png">
+                      <option value="png">PNG</option><option value="jpg">JPG</option><option value="pdf">PDF</option>
+                      <option value="mp4">MP4</option><option value="pptx">PPTX</option>
+                      <option value="gif">GIF</option><option value="csv">CSV</option>
+                    </select>
+                    <button className="wa-btn ghost" id="canvaExportRefresh" type="button">Check export</button>
+                  </div>
+                  <div id="canvaExportResult" className="wa-note" aria-live="polite" />
+                  <div id="canvaGeneration" className="fb-controls" hidden>
+                    <div className="fb-mini-heading">AI design generation (Canva preview API)</div>
+                    <p className="wa-note">Available only where your account and app have preview access. Uses Canva AI credits.</p>
+                    <div className="wa-field">
+                      <label htmlFor="canvaBrief">Design brief</label>
+                      <textarea id="canvaBrief" rows="3" maxLength="5000" placeholder="Describe your presentation or document..." />
+                      <label htmlFor="canvaGenerationType">Design output</label>
+                      <select id="canvaGenerationType"><option value="presentation">Presentation</option><option value="doc">Document</option></select>
+                    </div>
+                    <div className="wa-actions">
+                      <button className="wa-btn" id="canvaGenerateBtn" type="button">Generate in Canva</button>
+                      <button className="wa-btn ghost" id="canvaGenerationRefresh" type="button">Check result</button>
+                    </div>
+                    <div id="canvaGenerationResult" className="wa-note" aria-live="polite" />
+                  </div>
                 </div>
               </section>
 
